@@ -1,0 +1,323 @@
+<?php
+
+/**
+ * @file
+ * Adyax WS module main file.
+ */
+
+/**
+ * Implements hook_help().
+ */
+function adyax_ws_help($path, $arg) {
+  switch ($path) {
+    case 'admin/help#adyax_ws':
+      $filepath = dirname(__FILE__) . '/readme.txt';
+      if (file_exists($filepath)) {
+        $readme = file_get_contents($filepath);
+      }
+
+      if (!isset($readme)) {
+        return NULL;
+      }
+      if (module_exists('markdown')) {
+        $filters = module_invoke('markdown', 'filter_info');
+        $info = $filters['filter_markdown'];
+
+        if (function_exists($info['process callback'])) {
+          $output = $info['process callback']($readme, NULL);
+        }
+        else {
+          $output = '<pre>' . $readme . '</pre>';
+        }
+      }
+      else {
+        $output = '<pre>' . $readme . '</pre>';
+      }
+      return $output;
+  }
+}
+
+/**
+ * Implements hook_menu().
+ */
+function adyax_ws_menu() {
+  $items = array();
+
+  $items['adyax_ws'] = array(
+    // Set callback function.
+    'page callback' => 'adyax_ws_handle_request',
+    // Set access callback to true instead of actual checking access rules.
+    'access callback' => TRUE,
+    // Simply register a path so that the correct information is generated
+    // when the path is accessed.
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+/**
+ * Routes request to correct handler.
+ */
+function adyax_ws_handle_request() {
+  $accept = $_SERVER['HTTP_ACCEPT'];
+  $method = $_SERVER['REQUEST_METHOD'];
+  $parameters = drupal_get_query_parameters();
+
+  // Check if application expects json answer.
+  if ($accept != 'application/json') {
+    adyax_ws_return_status_code(406);
+  }
+
+  // Check if nid parameter exists and is integer.
+  if (array_key_exists('nid', $parameters) &&
+    NULL === filter_var($parameters['nid'], FILTER_VALIDATE_INT, FILTER_NULL_ON_FAILURE)) {
+    adyax_ws_return_status_code(403);
+  }
+
+  switch ($method) {
+    case 'GET':
+      adyax_ws_get_handler($parameters['nid']);
+      break;
+
+    case 'POST':
+      adyax_ws_post_handler();
+      break;
+
+    case 'PUT':
+      adyax_ws_put_handler($parameters['nid']);
+      break;
+
+    case 'DELETE':
+      adyax_ws_delete_handler($parameters['nid']);
+      break;
+
+    // If method is not GET, POST, PUT or DELETE, don't allow this method.
+    default:
+      adyax_ws_return_status_code(405);
+      break;
+  }
+}
+
+/**
+ * Handles GET requests.
+ *
+ * Returns JSON with data from node by nid in case node with this nid exists,
+ * returns 404 otherwise.
+ *
+ * @param int $nid
+ *   Id of a node to be returned in server answer.
+ */
+function adyax_ws_get_handler($nid) {
+  // If node exists return its fields as Json.
+  if ($node = node_load($nid)) {
+
+    // Get node title. Hopefully, other extra-fields are not needed.
+    $fields['title'] = $node->title;
+
+    // Get all field names of this node type.
+    $instances = field_info_instances('node', $node->type);
+    $field_names = array_keys($instances);
+
+    // Get the values of all fields.
+    foreach ($field_names as $field_name) {
+      if ($field = field_get_items('node', $node, $field_name, $node->language)) {
+        if (count($field) > 1) {
+          // Include all items in case of Multifield.
+          foreach ($field as $number => $item) {
+            $fields[$field_name][$number] = $item['value'];
+          }
+        }
+        else {
+          // Include single item.
+          $fields[$field_name] = $field[0]['value'];
+        }
+      }
+    }
+    // Return encoded fields. Don't forget about headers.
+    print drupal_json_encode($fields);
+    adyax_ws_return_status_code(200);
+  }
+  else {
+    adyax_ws_return_status_code(404);
+  }
+}
+
+/**
+ * Handles POST requests.
+ *
+ * Retrieves JSON data with title, type and body and create new node based on
+ * provided data.
+ */
+function adyax_ws_post_handler() {
+  // Check Content-Type.
+  if ($_SERVER["CONTENT_TYPE"] != 'application/json') {
+    adyax_ws_return_status_code(403);
+  }
+
+  // Check if received json contains all needed info.
+  // Reading from php://input, because $_POST is not populated in case of
+  // Content-Type: application/json.
+  $post_data = file_get_contents("php://input");
+  $post_array = drupal_json_decode($post_data);
+
+  if (empty($post_array) || !array_key_exists('type', $post_array) ||
+    !array_key_exists('title', $post_array) || !array_key_exists('body', $post_array)) {
+    adyax_ws_return_status_code(403);
+  }
+
+  // Check if received node type exists.
+  $existing_node_types = array_keys(node_type_get_types());
+  if (!in_array($post_array['type'], $existing_node_types)) {
+    adyax_ws_return_status_code(403);
+  }
+
+  // Check if this node type has body field (body may be removed).
+  $instances = field_info_instances('node', $post_array['type']);
+  $field_names = array_keys($instances);
+  if (!in_array('body', $field_names)) {
+    adyax_ws_return_status_code(403);
+  }
+
+  // Since all checks are passed, create node.
+  $node = new stdClass();
+  $node->type = $post_array['type'];
+  node_object_prepare($node);
+
+  // Add title.
+  $node->title    = check_plain($post_array['title']);
+  // Set language to none as for single language site.
+  $node->language = LANGUAGE_NONE;
+
+  // Add body.
+  $node->body[$node->language][0]['value']   = check_plain($post_array['body']);
+  $node->body[$node->language][0]['summary'] = text_summary(check_plain($post_array['body']));
+  $node->body[$node->language][0]['format']  = 'plain_text';
+
+  // Publish node.
+  $node->status = 1;
+  // Don't promote node to front page.
+  $node->promote = 0;
+  // Disable comments.
+  $node->comment = 0;
+
+  $node = node_submit($node);
+  node_save($node);
+
+  // Return newly created node URI in Location.
+  drupal_add_http_header('Location', 'node/' . $node->nid);
+  adyax_ws_return_status_code(201);
+}
+
+/**
+ * Handles PUT requests.
+ *
+ * Retrieves json data and update node by nid.
+ *
+ * @param int $nid
+ *   Id of a node to be edited.
+ */
+function adyax_ws_put_handler($nid) {
+  // Check Content-Type.
+  if ($_SERVER["CONTENT_TYPE"] != 'application/json') {
+    adyax_ws_return_status_code(403);
+  }
+
+  // Check if node with provided nid exists.
+  if ($node = node_load($nid)) {
+    $put_data = file_get_contents("php://input");
+    $put_array = drupal_json_decode($put_data);
+
+    // Check if at least one field was passed.
+    if (empty($put_array) ||
+      (!array_key_exists('title', $put_array) && !array_key_exists('body', $put_array))) {
+      adyax_ws_return_status_code(403);
+    }
+
+    // Check if Title should be updated.
+    if (array_key_exists('title', $put_array)) {
+      $node->title = check_plain($put_array['title']);
+    }
+
+    $instances = field_info_instances('node', $node->type);
+    $field_names = array_keys($instances);
+    // Check if this node type has body field (body may be removed) and
+    // body should be updated.
+    if (in_array('body', $field_names) && array_key_exists('body', $put_array)) {
+      $node->body[$node->language][0]['value'] = check_plain($put_array['body']);
+    }
+
+    // Since all checks are passed, update node.
+    $node = node_submit($node);
+    node_save($node);
+    adyax_ws_return_status_code(200);
+  }
+  else {
+    adyax_ws_return_status_code(404);
+  }
+}
+
+/**
+ * Handles DELETE requests.
+ *
+ * Deletes a node by nid in case node with this nid exists,
+ * returns 404 otherwise.
+ *
+ * @param int $nid
+ *   Id of a node to be deleted.
+ */
+function adyax_ws_delete_handler($nid) {
+  if (node_load($nid)) {
+    // If node exists, delete it.
+    node_delete($nid);
+    adyax_ws_return_status_code(200);
+  }
+  else {
+    // If node doesn't exist, return 404.
+    adyax_ws_return_status_code(404);
+  }
+}
+
+/**
+ * Returns HTTP status, also terminates the current request if error occurred.
+ *
+ * @param string $status
+ *   Status code to be returned via the HTTP Status header.
+ */
+function adyax_ws_return_status_code($status) {
+  switch ($status) {
+    case 200:
+      drupal_add_http_header('Content-Type', 'application/json');
+      drupal_add_http_header('Status', '200 OK');
+      drupal_exit();
+
+    case 201:
+      drupal_add_http_header('Content-Type', 'application/json');
+      drupal_add_http_header('Status', '201 Created');
+      drupal_exit();
+
+    case 403:
+      watchdog('adyax_ws', '403 Forbidden: %url',
+        ['%url' => check_plain($_GET['q'])], WATCHDOG_WARNING);
+      drupal_add_http_header('Status', '403 Forbidden');
+      drupal_exit();
+
+    case 404:
+      watchdog('adyax_ws', '404 Not Found: %url',
+        ['%url' => check_plain($_GET['q'])], WATCHDOG_WARNING);
+      drupal_add_http_header('Status', '404 Not Found');
+      drupal_exit();
+
+    case 405:
+      watchdog('adyax_ws', '405 Method Not Allowed: %url',
+        ['%url' => check_plain($_GET['q'])], WATCHDOG_WARNING);
+      drupal_add_http_header('Status', '405 Method Not Allowed');
+      drupal_exit();
+
+    case 406:
+      watchdog('adyax_ws', '406 Not Acceptable: %url',
+        ['%url' => check_plain($_GET['q'])], WATCHDOG_WARNING);
+      drupal_add_http_header('Status', '406 Not Acceptable');
+      drupal_exit();
+  }
+}

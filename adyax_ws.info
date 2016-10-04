@@ -1,0 +1,7 @@
+name = Adyax WS
+description = This module was created as a technical test for Adyax team.
+
+; As far as I created custom module, I'll add the following parameters,
+; despite module packager on drupal.org adds these parameters automatically.
+core = 7.x
+version = 7.0
